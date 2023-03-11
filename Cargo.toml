@@ -1,0 +1,21 @@
+[package]
+name = "procedural_generation"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "procedural_generation"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bin"
+path = "src/main.rs"
+
+[dependencies]
+bevy = "0.10.0"
+bevy_fly_camera = "0.10.0"
+ndarray = "0.15.6"
+noise = "0.8.2"
+
+[profile.dev.package."*"]
+opt-level = 3
