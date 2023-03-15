@@ -4,6 +4,7 @@ use ndarray::Array2;
 use super::TerrainMeshData;
 use crate::HeightMap;
 
+// A position in the terrain/error grid
 #[derive(Clone, Copy, Debug)]
 struct Coord {
     x: usize,
@@ -53,7 +54,7 @@ fn top_right_root(tile_size: usize) -> Triangle {
 
 impl Triangle {
     fn from_id(mut id: usize, tile_size: usize) -> Self {
-        // Select starting triangle
+        // Determine starting triangle
         let mut tri = if id & 1 > 0 {
             // Bottom-left triangle
             bottom_left_root(tile_size)
@@ -63,14 +64,16 @@ impl Triangle {
         };
 
         // Subdivide triangle
-        while (id >> 1) > 1 {
+        while (id / 2) > 1 {
             id /= 2;
-            if id & 1 > 0 {
-                tri = tri.to_left_child();
+
+            tri = if id & 1 > 0 {
+                // Left half
+                tri.to_left_child()
             } else {
                 // Right half
-                tri = tri.to_right_child();
-            }
+                tri.to_right_child()
+            };
         }
 
         tri
@@ -94,11 +97,13 @@ impl Triangle {
     // }
 
     // Returns index into error/terrain array of left child
+    // (Midpoint of child)
     fn left_child_idx(&self) -> [usize; 2] {
         [(self.a.x + self.c.x) / 2, (self.a.y + self.c.y) / 2]
     }
 
     // Returns index into error/terrain array of right child
+    // (Midpoint of child)
     fn right_child_idx(&self) -> [usize; 2] {
         [(self.b.x + self.c.x) / 2, (self.b.y + self.c.y) / 2]
     }
@@ -107,7 +112,7 @@ impl Triangle {
     fn not_leaf(&self) -> bool {
         self.a.manhattan_distance(&self.c) > 1
     }
-    
+
     #[inline(always)]
     fn to_left_child(mut self) -> Self {
         let m = self.midpoint();
@@ -132,7 +137,6 @@ struct Tile {
     errors: Array2<f32>,
 }
 
-// TODO: Update struct name
 struct TileMeshInfo {
     num_vertices: usize,
     num_triangles: usize,
@@ -140,13 +144,44 @@ struct TileMeshInfo {
     indices: Array2<usize>,
 }
 
-// TODO: Update struct name
-struct TileTrianglesInfo {
-    mesh_info: TileMeshInfo,
-    // \/ This is TerrainMeshData... \/
+struct TileMeshData {
     vertices: Vec<Vec3>,
+    normal_sums: Vec<Vec3>,
+    normal_counts: Vec<usize>,
     triangles: Vec<u32>,
-    normals: Vec<Vec3>,
+    info: TileMeshInfo,
+}
+
+impl TileMeshData {
+    fn new(mesh_info: TileMeshInfo) -> Self {
+        TileMeshData {
+            vertices: vec![Vec3::ZERO; mesh_info.num_vertices],
+            normal_sums: vec![Vec3::ZERO; mesh_info.num_vertices],
+            normal_counts: vec![0; mesh_info.num_vertices],
+            triangles: vec![0; mesh_info.num_triangles * 3],
+            info: mesh_info,
+        }
+    }
+}
+
+impl From<TileMeshData> for TerrainMeshData {
+    fn from(mut mesh_data: TileMeshData) -> TerrainMeshData {
+        // Average normals in place
+        for (normal, count) in mesh_data
+            .normal_sums
+            .iter_mut()
+            .zip(mesh_data.normal_counts.into_iter())
+        {
+            *normal /= count as f32;
+            *normal = normal.normalize();
+        }
+
+        TerrainMeshData {
+            vertices: mesh_data.vertices,
+            triangles: mesh_data.triangles,
+            normals: mesh_data.normal_sums,
+        }
+    }
 }
 
 impl Tile {
@@ -158,14 +193,14 @@ impl Tile {
         assert!(tile_size.is_power_of_two(), "Terrain size must be 2^k+1");
 
         // TODO: explain these formulas
-        let max_num_triangles = tile_size * tile_size * 2 - 2;
+        let max_num_triangles = tile_size * tile_size * 2;
         let num_parent_triangles = max_num_triangles - tile_size * tile_size;
 
         let mut errors: Array2<f32> = Array2::zeros(terrain.dim());
 
         // Calculate the error for each possible triangles, starting from the smallest level
         for i in (0..max_num_triangles - 1).rev() {
-            let tri = Triangle::from_id(i, grid_size - 1);
+            let tri = Triangle::from_id(i + 2, grid_size - 1);
 
             // Calculate error in the middle of the long edge of the triangle
             let interpolated_height = (terrain.0[tri.a.idx()] + terrain.0[tri.b.idx()]) / 2.;
@@ -189,8 +224,9 @@ impl Tile {
         self.terrain.dim().0
     }
 
-    fn get_mesh(&self, max_error: f32) -> TileTrianglesInfo {
+    fn get_mesh(&self, max_error: f32) -> TerrainMeshData {
         let size = self.grid_size();
+        let tile_size = size - 1;
 
         // Use an index grid to keep track of vertices that were already used to
         // avoid duplication
@@ -201,28 +237,19 @@ impl Tile {
             indices: Array2::zeros((size, size)),
         };
 
-        let max = size - 1;
-
         // Retrieve mesh in two stages that both traverse the error map:
         // - countElements: find used vertices (and assign each an index), and count triangles (for minimum allocation)
         // - processTriangle: fill the allocated vertices & triangles typed arrays
 
-        self.count_elements(&mut mesh_info, bottom_left_root(max));
-        self.count_elements(&mut mesh_info, top_right_root(max));
+        self.count_elements(&mut mesh_info, bottom_left_root(tile_size));
+        self.count_elements(&mut mesh_info, top_right_root(tile_size));
 
-        dbg!(mesh_info.num_triangles);
+        let mut mesh_data = TileMeshData::new(mesh_info);
 
-        let mut triangles = TileTrianglesInfo {
-            vertices: vec![Vec3::ZERO; mesh_info.num_vertices],
-            normals: vec![Vec3::ZERO; mesh_info.num_vertices],
-            triangles: vec![0; mesh_info.num_vertices * 3],
-            mesh_info,
-        };
+        self.process_triangle(&mut mesh_data, bottom_left_root(tile_size));
+        self.process_triangle(&mut mesh_data, top_right_root(tile_size));
 
-        self.process_triangle(&mut triangles, bottom_left_root(max));
-        self.process_triangle(&mut triangles, top_right_root(max));
-
-        triangles
+        mesh_data.into()
     }
 
     fn count_elements(&self, mesh_info: &mut TileMeshInfo, tri: Triangle) {
@@ -231,68 +258,62 @@ impl Tile {
             self.count_elements(mesh_info, tri.to_right_child());
         } else {
             if mesh_info.indices[tri.a.idx()] == 0 {
-                mesh_info.indices[tri.a.idx()] = mesh_info.num_vertices;
+                // Add 1 first because 0 is reserved to mean no vertex
                 mesh_info.num_vertices += 1;
+                mesh_info.indices[tri.a.idx()] = mesh_info.num_vertices;
             }
 
             if mesh_info.indices[tri.b.idx()] == 0 {
-                mesh_info.indices[tri.b.idx()] = mesh_info.num_vertices;
                 mesh_info.num_vertices += 1;
+                mesh_info.indices[tri.b.idx()] = mesh_info.num_vertices;
             }
 
             if mesh_info.indices[tri.c.idx()] == 0 {
-                mesh_info.indices[tri.c.idx()] = mesh_info.num_vertices;
                 mesh_info.num_vertices += 1;
+                mesh_info.indices[tri.c.idx()] = mesh_info.num_vertices;
             }
             mesh_info.num_triangles += 1;
         }
     }
 
-    fn process_triangle(&self, triangles: &mut TileTrianglesInfo, tri: Triangle) {
-        if tri.not_leaf() && (self.errors[tri.midpoint().idx()] > triangles.mesh_info.max_error) {
+    fn process_triangle(&self, mesh_data: &mut TileMeshData, tri: Triangle) {
+        if tri.not_leaf() && (self.errors[tri.midpoint().idx()] > mesh_data.info.max_error) {
             // Triangle doesn't approximate the surface well enough; drill down further
-            self.process_triangle(triangles, tri.to_left_child());
-            self.process_triangle(triangles, tri.to_right_child());
+            self.process_triangle(mesh_data, tri.to_left_child());
+            self.process_triangle(mesh_data, tri.to_right_child());
         } else {
             // Add a triangle
-            let a = triangles.mesh_info.indices[tri.a.idx()];
-            let b = triangles.mesh_info.indices[tri.b.idx()];
-            let c = triangles.mesh_info.indices[tri.c.idx()];
+            // Subtract 1 because 0 is reserved to mean no vertex
+            let a = mesh_data.info.indices[tri.a.idx()] - 1;
+            let b = mesh_data.info.indices[tri.b.idx()] - 1;
+            let c = mesh_data.info.indices[tri.c.idx()] - 1;
 
-            triangles.vertices[a] = self.terrain.vertex_at(tri.a.x, tri.a.y);
-            triangles.vertices[b] = self.terrain.vertex_at(tri.b.x, tri.b.y);
-            triangles.vertices[c] = self.terrain.vertex_at(tri.c.x, tri.c.y);
+            mesh_data.vertices[a] = self.terrain.vertex_at(tri.a.x, tri.a.y);
+            mesh_data.vertices[b] = self.terrain.vertex_at(tri.b.x, tri.b.y);
+            mesh_data.vertices[c] = self.terrain.vertex_at(tri.c.x, tri.c.y);
 
-            // TODO: better normal approximation
-            triangles.normals[a] = self.terrain.normal_at(tri.a.x, tri.a.y);
-            triangles.normals[b] = self.terrain.normal_at(tri.b.x, tri.b.y);
-            triangles.normals[c] = self.terrain.normal_at(tri.c.x, tri.c.y);
+            // Track sum of normals of surrounding triangles and count to average at each vertex later
+            let tangent_1 = mesh_data.vertices[a] - mesh_data.vertices[b];
+            let tangent_2 = mesh_data.vertices[a] - mesh_data.vertices[c];
+            let normal = tangent_1.cross(tangent_2);
+            mesh_data.normal_sums[a] += normal;
+            mesh_data.normal_sums[b] += normal;
+            mesh_data.normal_sums[c] += normal;
+            mesh_data.normal_counts[a] += 1;
+            mesh_data.normal_counts[b] += 1;
+            mesh_data.normal_counts[c] += 1;
 
-            triangles.triangles.push(a as u32);
-            triangles.triangles.push(b as u32);
-            triangles.triangles.push(c as u32);
+            mesh_data.triangles.push(a as u32);
+            mesh_data.triangles.push(b as u32);
+            mesh_data.triangles.push(c as u32);
         }
     }
 }
 
 pub fn heightmap_to_rtin_mesh(terrain: HeightMap, max_error: f32) -> TerrainMeshData {
-    // Set up mesh generator for a certain 2^k+1 grid size
-    //let martini = Martini::new(terrain.dim().0 /* + 1 */);
-
-    // Generate RTIN hierarchy from terrain data (an array of size^2 length)
+    // Generate RTIN hierarchy from terrain height map
     let tile = Tile::new(terrain);
 
-    // Get a mesh (vertices and triangles indices) for a 10m error
-    let TileTrianglesInfo {
-        vertices,
-        normals,
-        triangles,
-        ..
-    } = tile.get_mesh(max_error);
-
-    TerrainMeshData {
-        vertices,
-        triangles,
-        normals,
-    }
+    // Get a mesh (vertices and triangles indices)
+    tile.get_mesh(max_error)
 }
